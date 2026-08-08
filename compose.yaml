@@ -1,0 +1,120 @@
+services:
+  kubeman:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    image: kubeman-console:local
+    container_name: kubeman
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${KUBEMAN_PORT:-3080}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+    volumes:
+      - kubeman-data:/app/data
+    depends_on:
+      kubeman-shell:
+        condition: service_healthy
+      kubeman-aws:
+        condition: service_healthy
+      kubeman-bootstrap:
+        condition: service_healthy
+
+  kubeman-shell:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shell
+    image: kubeman-shell:local
+    container_name: kubeman-shell
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${KUBEMAN_SHELL_PORT:-7681}:7681"
+    environment:
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      KUBECONFIG: /home/operator/.kubeman/kubeconfig
+    volumes:
+      - kubeman-shell-home:/home/operator
+      - "${HOME}/.kube:/home/operator/.kube:ro"
+      - "${HOME}/.aws:/home/operator/.aws:ro"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+
+  kubeman-aws:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shell
+    image: kubeman-shell:local
+    container_name: kubeman-aws
+    restart: unless-stopped
+    command: ["python3", "/usr/local/bin/kubeman-aws-discovery"]
+    ports:
+      - "127.0.0.1:${KUBEMAN_AWS_PORT:-7682}:7682"
+    environment:
+      HOME: /home/operator
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - kubeman-shell-home:/home/operator
+      - "${HOME}/.aws:/home/operator/.aws:ro"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7682/health"]
+      interval: 15s
+      timeout: 4s
+      start_period: 8s
+      retries: 4
+
+  kubeman-bootstrap:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shell
+    image: kubeman-shell:local
+    container_name: kubeman-bootstrap
+    restart: unless-stopped
+    command: ["python3", "/usr/local/bin/kubeman-bootstrap"]
+    ports:
+      - "127.0.0.1:${KUBEMAN_BOOTSTRAP_PORT:-7683}:7683"
+    environment:
+      HOME: /home/operator
+      PYTHONDONTWRITEBYTECODE: "1"
+      KUBEMAN_GOOGLE_CLIENT_ID: "${KUBEMAN_GOOGLE_CLIENT_ID:-}"
+      KUBEMAN_GOOGLE_CLIENT_SECRET: "${KUBEMAN_GOOGLE_CLIENT_SECRET:-}"
+    volumes:
+      - kubeman-bootstrap-data:/home/operator/.kubeman-bootstrap
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7683/health"]
+      interval: 15s
+      timeout: 4s
+      start_period: 8s
+      retries: 4
+
+volumes:
+  kubeman-data:
+    name: kubeman-data
+  kubeman-shell-home:
+    name: kubeman-shell-home
+  kubeman-bootstrap-data:
+    name: kubeman-bootstrap-data

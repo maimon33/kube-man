@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { getChatGPTUser } from "./chatgpt-auth";
-import ConsoleApp from "./ConsoleApp";
+import BootstrapGate from "./BootstrapGate";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +12,7 @@ export const metadata: Metadata = {
 export default async function Home() {
   const user = await getChatGPTUser();
   return (
-    <ConsoleApp
+    <BootstrapGate
       user={{
         name: user?.fullName ?? "Alex Morgan",
         email: user?.email ?? "alex@acme.dev",

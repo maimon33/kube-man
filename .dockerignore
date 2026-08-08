@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+.next
+.vinext
+.wrangler
+artifacts
+dist
+node_modules
+npm-debug.log*
+Dockerfile*
+compose*.yaml
+README.md
+.env*

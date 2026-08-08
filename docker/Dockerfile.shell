@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+FROM alpine:3.22
+
+RUN apk add --no-cache \
+  aws-cli bash bind-tools ca-certificates coreutils curl findutils gawk git \
+  grep helm iproute2 iputils jq kubectl less nano openssh-client procps sed \
+  tar ttyd unzip vim yq zip
+
+RUN addgroup -g 1000 -S operator && adduser -u 1000 -S operator -G operator -s /bin/bash
+RUN mkdir -p /home/operator/.kubeman-bootstrap && chown operator:operator /home/operator/.kubeman-bootstrap
+COPY --chown=operator:operator docker/shell.bashrc /home/operator/.bashrc
+COPY --chmod=755 docker/start-context-shell.sh /usr/local/bin/kubeman-context-shell
+COPY --chmod=755 docker/aws-discovery-api.py /usr/local/bin/kubeman-aws-discovery
+COPY --chmod=755 docker/bootstrap-api.py /usr/local/bin/kubeman-bootstrap
+
+USER operator
+ENV HOME=/home/operator
+ENV SHELL=/bin/bash
+ENV TERM=xterm-256color
+WORKDIR /home/operator
+
+EXPOSE 7681
+HEALTHCHECK --interval=15s --timeout=4s --start-period=10s --retries=4 \
+  CMD wget -q -O /dev/null http://127.0.0.1:7681/ || exit 1
+CMD ["ttyd", "-W", "-a", "-p", "7681", "-i", "0.0.0.0", "-t", "titleFixed=KubeMan Shell", "-t", "fontSize=13", "-t", "cursorBlink=true", "kubeman-context-shell"]

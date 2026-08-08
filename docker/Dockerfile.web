@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+FROM node:22-alpine AS dependencies
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+FROM dependencies AS build
+WORKDIR /app
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=3000
+
+RUN addgroup -S kubeman && adduser -S kubeman -G kubeman
+COPY --from=build --chown=kubeman:kubeman /app/dist/standalone ./
+
+USER kubeman
+EXPOSE 3000
+HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1
+CMD ["node", "server.js"]

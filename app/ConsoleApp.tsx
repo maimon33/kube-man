@@ -1,8 +1,28 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from "react";
 
 type User = { name: string; email: string; isAdmin: boolean };
+type ModalType = "invite" | "credential" | "bastion";
+type PaneId = "resources" | "terminal" | "flow" | "events";
+type AwsCredentialInput = { profile: string; region: string; roleArn: string; accessKeyId: string; secretAccessKey: string; sessionToken: string };
+type AwsCluster = {
+  name: string; region: string; status: string; version: string; platformVersion: string;
+  endpoint: string; endpointIps: string[]; assignedRoleArn: string; assignedRoleName: string;
+  clusterServiceRoleArn: string; accountId: string; endpointPublicAccess: boolean;
+  endpointPrivateAccess: boolean; publicAccessCidrs: string[]; discoveredAt: string;
+  vpc: { VpcId?: string; CidrBlock?: string; IsDefault?: boolean };
+  subnets: { SubnetId?: string; AvailabilityZone?: string; CidrBlock?: string; AvailableIpAddressCount?: number; MapPublicIpOnLaunch?: boolean }[];
+  securityGroups: { GroupId?: string; GroupName?: string; Description?: string; VpcId?: string }[];
+  networkConfig: { ipFamily?: string; serviceIpv4Cidr?: string; serviceIpv6Cidr?: string };
+};
+
+const tileCatalog: { id: PaneId; name: string; description: string; icon: string }[] = [
+  { id: "resources", name: "Kubernetes resources", description: "Workloads, services, and health", icon: "K8" },
+  { id: "terminal", name: "Live terminal", description: "Bash, kubectl, Helm, and AWS", icon: ">_" },
+  { id: "flow", name: "Resource flow", description: "Topology and live traffic paths", icon: "⌘" },
+  { id: "events", name: "Events & history", description: "Warnings, changes, and audit trail", icon: "◷" },
+];
 
 const resources = [
   ["api-gateway-7d8c9", "Pod", "Running", "142m", "34%"],
@@ -21,127 +41,362 @@ const events = [
 ];
 
 const members = [
-  ["Alex Morgan", "alex@acme.dev", "Admin", "All clusters", "Just now"],
+  ["Alex Morgan", "alex@acme.dev", "Admin", "All environments", "Just now"],
   ["Maya Chen", "maya@acme.dev", "Operator", "Production", "18 min ago"],
-  ["Sam Rivera", "sam@acme.dev", "Viewer", "Staging", "Yesterday"],
-  ["Noah Williams", "noah@acme.dev", "Operator", "3 clusters", "Aug 5"],
+  ["Sam Rivera", "sam@acme.dev", "Viewer", "Read only", "Yesterday"],
+  ["Noah Williams", "noah@acme.dev", "Operator", "Selected groups", "Aug 5"],
 ];
+
+const credentials = [
+  ["production-eks", "AWS IAM role", "1234 5678 9012", "Healthy", "Aug 2, 2026"],
+  ["staging-eks", "Access key", "2345 6789 0123", "Rotate soon", "May 18, 2026"],
+  ["billing-readonly", "AWS IAM role", "1234 5678 9012", "Healthy", "Jul 29, 2026"],
+];
+
+const exampleCluster = "production-us-east-1";
 
 export default function ConsoleApp({ user }: { user: User }) {
   const [section, setSection] = useState<"workspace" | "admin">("workspace");
-  const [layout, setLayout] = useState<2 | 3 | 4>(4);
+  const [visibleTiles, setVisibleTiles] = useState<PaneId[]>(["resources", "terminal", "flow", "events"]);
+  const [splitDirection, setSplitDirection] = useState<"vertical" | "horizontal">("vertical");
+  const [splitX, setSplitX] = useState(54);
+  const [splitY, setSplitY] = useState(50);
+  const [collapsed, setCollapsed] = useState<Set<PaneId>>(new Set());
   const [resourceScope, setResourceScope] = useState("Workloads");
   const [eventFilter, setEventFilter] = useState("All");
   const [selectedNode, setSelectedNode] = useState("service");
-  const [terminalLines, setTerminalLines] = useState<string[]>([]);
-  const [command, setCommand] = useState("");
-  const [modal, setModal] = useState<null | "cluster" | "invite">(null);
+  const [selectedCluster, setSelectedCluster] = useState(exampleCluster);
+  const [awsClusters, setAwsClusters] = useState<AwsCluster[]>([]);
+  const [shellBaseUrl, setShellBaseUrl] = useState("");
+  const [shellRevision, setShellRevision] = useState(0);
+  const [palette, setPalette] = useState("forest");
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [tileMenuOpen, setTileMenuOpen] = useState(false);
+  const [draggedTile, setDraggedTile] = useState<PaneId | null>(null);
+  const [modal, setModal] = useState<ModalType | null>(null);
   const [toast, setToast] = useState("");
-  const filteredEvents = useMemo(() => eventFilter === "All" ? events : events.filter((event) => event[1] === eventFilter.toLowerCase()), [eventFilter]);
+
+  const filteredEvents = useMemo(
+    () => eventFilter === "All" ? events : events.filter((event) => event[1] === eventFilter.toLowerCase()),
+    [eventFilter],
+  );
+
+  useEffect(() => {
+    const savedPalette = window.localStorage.getItem("kubeman-palette");
+    if (savedPalette) setPalette(savedPalette);
+    const savedTileOrder = window.localStorage.getItem("kubeman-tile-order");
+    if (savedTileOrder) {
+      try {
+        const order = JSON.parse(savedTileOrder) as PaneId[];
+        if (order.length && order.every((tile) => tileCatalog.some((item) => item.id === tile))) setVisibleTiles(order);
+      } catch { /* Ignore malformed device-local layout preferences. */ }
+    }
+    setShellBaseUrl(`${window.location.protocol}//${window.location.hostname}:7681/`);
+    fetch(`${window.location.protocol}//${window.location.hostname}:7682/clusters`)
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((data: { clusters?: AwsCluster[] }) => {
+        const discovered = data.clusters ?? [];
+        setAwsClusters(discovered);
+        if (discovered.length) setSelectedCluster(discovered[0].name);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const clusterNames = awsClusters.length ? awsClusters.map((cluster) => cluster.name) : [exampleCluster];
+  const selectedClusterDetails = awsClusters.find((cluster) => cluster.name === selectedCluster);
+
+  const shellUrl = useMemo(() => shellBaseUrl
+    ? `${shellBaseUrl}?arg=${encodeURIComponent(selectedCluster)}&r=${shellRevision}`
+    : "", [selectedCluster, shellBaseUrl, shellRevision]);
 
   function notify(message: string) {
     setToast(message);
     window.setTimeout(() => setToast(""), 2600);
   }
 
-  function runCommand(event: FormEvent) {
-    event.preventDefault();
-    if (!command.trim()) return;
-    setTerminalLines((lines) => [...lines.slice(-4), `$ ${command}`, command.includes("get") ? "NAME                 READY   STATUS    AGE" : "Command queued in production-us-east-1"]);
-    setCommand("");
+  function choosePalette(nextPalette: string) {
+    setPalette(nextPalette);
+    window.localStorage.setItem("kubeman-palette", nextPalette);
+    setPaletteOpen(false);
+    notify(`${nextPalette[0].toUpperCase()}${nextPalette.slice(1)} palette applied`);
   }
 
+  function togglePane(id: PaneId) {
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function addTile(id: PaneId) {
+    setVisibleTiles((current) => {
+      const next = current.includes(id) ? current : [...current, id];
+      window.localStorage.setItem("kubeman-tile-order", JSON.stringify(next));
+      return next;
+    });
+    setCollapsed((current) => {
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+    setTileMenuOpen(false);
+    notify(`${tileCatalog.find((tile) => tile.id === id)?.name ?? "Tile"} added`);
+  }
+
+  function removeTile(id: PaneId) {
+    setVisibleTiles((current) => {
+      const next = current.filter((tile) => tile !== id);
+      window.localStorage.setItem("kubeman-tile-order", JSON.stringify(next));
+      return next;
+    });
+    notify("Tile removed — restore it from Add tile");
+  }
+
+  function reorderTile(source: PaneId, target: PaneId) {
+    if (source === target) return;
+    setVisibleTiles((current) => {
+      const from = current.indexOf(source);
+      const to = current.indexOf(target);
+      if (from < 0 || to < 0) return current;
+      const next = [...current];
+      next.splice(from, 1);
+      next.splice(to, 0, source);
+      window.localStorage.setItem("kubeman-tile-order", JSON.stringify(next));
+      return next;
+    });
+    notify(`${tileCatalog.find((tile) => tile.id === source)?.name ?? "Tile"} moved`);
+  }
+
+  function moveTile(id: PaneId, change: -1 | 1) {
+    const index = visibleTiles.indexOf(id);
+    const target = visibleTiles[index + change];
+    if (target) reorderTile(id, target);
+  }
+
+  function startResize(axis: "x" | "y", event: ReactPointerEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    const grid = event.currentTarget.parentElement;
+    if (!grid) return;
+    const rect = grid.getBoundingClientRect();
+    document.body.classList.add("is-resizing");
+    const move = (pointer: PointerEvent) => {
+      const value = axis === "x"
+        ? ((pointer.clientX - rect.left) / rect.width) * 100
+        : ((pointer.clientY - rect.top) / rect.height) * 100;
+      const clamped = Math.max(22, Math.min(78, value));
+      if (axis === "x") setSplitX(clamped); else setSplitY(clamped);
+    };
+    const stop = () => {
+      document.body.classList.remove("is-resizing");
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  }
+
+  async function modalDone(input?: AwsCredentialInput) {
+    if (modal === "credential" && input) {
+      const response = await fetch(`${window.location.protocol}//${window.location.hostname}:7682/discover`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      const result = await response.json() as { clusters?: AwsCluster[]; error?: string };
+      if (!response.ok) throw new Error(result.error || "AWS cluster discovery failed");
+      const discovered = result.clusters ?? [];
+      setAwsClusters(discovered);
+      if (discovered.length) {
+        setSelectedCluster(discovered[0].name);
+        setShellRevision((revision) => revision + 1);
+      }
+      setModal(null);
+      notify(discovered.length ? `${discovered.length} EKS cluster${discovered.length === 1 ? "" : "s"} discovered` : "AWS connected — no EKS clusters found in this scope");
+      return;
+    }
+    const message = modal === "invite" ? "Invitation queued" : "Bastion tunnel profile saved";
+    setModal(null);
+    notify(message);
+  }
+
+  if (section === "admin") {
+    return (
+      <div className="admin-app" data-palette={palette}>
+        <AdminHeader user={user} palette={palette} paletteOpen={paletteOpen} setPaletteOpen={setPaletteOpen} choosePalette={choosePalette} onBack={() => setSection("workspace")} />
+        <AdminView cluster={selectedCluster} clusters={awsClusters} onInvite={() => setModal("invite")} onCredential={() => setModal("credential")} onBastion={() => setModal("bastion")} notify={notify} />
+        {modal && <Modal type={modal} close={() => setModal(null)} submit={modalDone} />}
+        {toast && <div className="toast">✓&nbsp;&nbsp;{toast}</div>}
+      </div>
+    );
+  }
+
+  const gridStyle = { "--split-x": `${splitX}%`, "--split-y": `${splitY}%` } as CSSProperties;
+  const layout = Math.max(1, visibleTiles.length);
+  const movementProps = (id: PaneId) => ({
+    position: visibleTiles.indexOf(id), total: visibleTiles.length, dragging: draggedTile === id,
+    move: moveTile,
+    dragStart: (event: ReactDragEvent<HTMLElement>) => {
+      setDraggedTile(id);
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", id);
+    },
+    dragEnd: () => setDraggedTile(null),
+    drop: () => {
+      if (draggedTile) reorderTile(draggedTile, id);
+      setDraggedTile(null);
+    },
+  });
+
   return (
-    <div className="app">
+    <div className="app" data-palette={palette}>
       <header className="topbar">
         <div className="brand"><div className="brand-mark">KM</div><span>KubeMan</span></div>
-        <button className="cluster-select" onClick={() => setModal("cluster")} aria-label="Switch cluster">
-          <span style={{ display: "flex", alignItems: "center", gap: 8 }}><i className="cluster-dot" /><strong>production-us-east-1</strong></span><span>⌄</span>
-        </button>
+        <label className="cluster-select" aria-label="Current cluster">
+          <i className="cluster-dot" />
+          <select value={selectedCluster} onChange={(event) => {
+            setSelectedCluster(event.target.value);
+            setShellRevision((revision) => revision + 1);
+            notify(`Dashboard and terminal switched to ${event.target.value}`);
+          }}>
+            {clusterNames.map((cluster) => {
+              const details = awsClusters.find((item) => item.name === cluster);
+              return <option key={cluster} value={cluster}>{cluster}{details ? ` — ${details.assignedRoleName}` : ""}</option>;
+            })}
+          </select>
+          <span className="only-cluster">{clusterNames.length} cluster{clusterNames.length === 1 ? "" : "s"}</span>
+        </label>
         <div className="top-actions">
           <button className="icon-btn command-trigger" onClick={() => notify("Command palette ready — try the terminal below")}>⌕&nbsp; Search or run <span className="key">⌘ K</span></button>
-          <button className="icon-btn" aria-label="Notifications" onClick={() => setEventFilter("warn")}>◔</button>
+          <PaletteControl palette={palette} open={paletteOpen} setOpen={setPaletteOpen} choose={choosePalette} />
+          <button className="icon-btn" aria-label="Notifications" onClick={() => setEventFilter("Warn")}>◔</button>
           <button className="icon-btn" aria-label="Help" onClick={() => notify("KubeMan help center will open here")}>?</button>
-          <div className="avatar" title={user.email}>{user.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div>
+          <div className="avatar" title={user.email}>{initials(user.name)}</div>
+          {user.isAdmin && <button className="admin-entry" onClick={() => setSection("admin")}>Admin</button>}
         </div>
       </header>
 
-      <nav className="rail" aria-label="Primary navigation">
-        <button className={`rail-btn ${section === "workspace" ? "active" : ""}`} onClick={() => setSection("workspace")} aria-label="Workspace">⌂</button>
-        <button className="rail-btn" onClick={() => { setSection("workspace"); notify("Resource explorer selected"); }} aria-label="Resources">▦</button>
-        <button className="rail-btn" onClick={() => { setSection("workspace"); setLayout(2); }} aria-label="Terminal">›_</button>
-        <button className="rail-btn" onClick={() => { setSection("workspace"); setLayout(3); }} aria-label="Topology">⌘</button>
-        <button className="rail-btn" onClick={() => { setSection("workspace"); setEventFilter("All"); }} aria-label="History">◷</button>
-        <div className="rail-spacer" />
-        {user.isAdmin && <button className={`rail-btn ${section === "admin" ? "active" : ""}`} onClick={() => setSection("admin")} aria-label="Administration">⚙</button>}
-      </nav>
-
-      <aside className="context">
-        <div className="context-head"><h2 className="context-title">Clusters</h2><button className="add-btn" onClick={() => setModal("cluster")} aria-label="Add cluster">+</button></div>
-        <input className="context-search" placeholder="Filter clusters…" aria-label="Filter clusters" />
-        <div className="nav-group">
-          <div className="group-label">Connected</div>
-          <button className="nav-row active"><i className="tree-line" />production-us-east-1<span className="count">24</span></button>
-          <button className="nav-row"><i className="tree-line" />staging-eu-west-1<span className="count">12</span></button>
-          <button className="nav-row"><i className="tree-line warn" />dev-platform<span className="count">8</span></button>
-        </div>
-        <div className="nav-group">
-          <div className="group-label">Saved views</div>
-          <button className="nav-row">☆ Critical workloads<span className="count">6</span></button>
-          <button className="nav-row">☆ Payments stack<span className="count">9</span></button>
-          <button className="nav-row">☆ Cost watch<span className="count">4</span></button>
-        </div>
-        <div className="nav-group">
-          <div className="group-label">Namespaces</div>
-          <button className="nav-row active">All namespaces<span className="count">16</span></button>
-          <button className="nav-row">commerce</button><button className="nav-row">payments</button><button className="nav-row">platform</button>
-        </div>
-        <div className="context-user"><div className="user-card"><div className="avatar">{user.name.split(" ").map((p) => p[0]).join("").slice(0,2)}</div><div className="user-meta"><strong>{user.name}</strong><span>{user.isAdmin ? "Workspace admin" : "Operator"}</span></div></div></div>
-      </aside>
-
       <main className="main">
-        {section === "workspace" ? (
-          <>
-            <div className="workspace-bar"><span className="crumb">Clusters / <strong>production-us-east-1</strong></span><span className="health"><i className="cluster-dot" /> Healthy · 24 nodes</span><div className="layout-controls" aria-label="Pane layout"><button className={`layout-btn ${layout === 2 ? "active" : ""}`} onClick={() => setLayout(2)}>Ⅱ</button><button className={`layout-btn ${layout === 3 ? "active" : ""}`} onClick={() => setLayout(3)}>Ⅲ</button><button className={`layout-btn ${layout === 4 ? "active" : ""}`} onClick={() => setLayout(4)}>▦</button></div></div>
-            <div className={`workspace-grid layout-${layout}`}>
-              <section className="pane">
-                <div className="pane-head"><span className="pane-title">Kubernetes</span><span className="pane-subtitle">commerce</span><div className="pane-actions"><div className="segmented">{["Workloads", "Network", "Config"].map((scope) => <button key={scope} className={resourceScope === scope ? "active" : ""} onClick={() => setResourceScope(scope)}>{scope}</button>)}</div><button className="tiny-btn" onClick={() => notify("Resource list refreshed")}>↻</button><button className="tiny-btn">•••</button></div></div>
-                <div className="resource-summary"><div className="summary-item"><strong>42</strong><span>Pods</span></div><div className="summary-item"><strong>18</strong><span>Deployments</span></div><div className="summary-item"><strong>12</strong><span>Services</span></div><div className="summary-item"><strong>99.8%</strong><span>Healthy</span></div></div>
-                <div className="resource-table"><div className="table-head"><span>Name</span><span>Status</span><span>CPU</span><span>Age</span></div>{resources.map(([name, kind, status, cpu, percent]) => <div className="table-row" key={name}><div className="resource-name"><span className="kind">{kind[0]}</span>{name}</div><span className="status-ok">{status}</span><span>{cpu}<div className="cpu-bar"><span style={{ width: percent }} /></div></span><span>{name.includes("redis") ? "12d" : "4h"}</span></div>)}</div>
-              </section>
-
-              <section className="pane terminal-pane">
-                <div className="pane-head"><span className="pane-title">Terminal</span><span className="pane-subtitle">bash · production</span><div className="pane-actions"><button className="tiny-btn" onClick={() => setTerminalLines([])}>⌫</button><button className="tiny-btn">＋</button><button className="tiny-btn">•••</button></div></div>
-                <div className="terminal-tabs"><button className="term-tab active">kubectl</button><button className="term-tab">helm</button><button className="term-tab">ops-shell</button></div>
-                <div className="terminal"><div className="term-line"><span className="prompt">alex@kubeman</span><span className="term-muted">:commerce $ </span><span className="cmd">kubectl get pods -o wide</span></div><div className="term-line term-muted">NAME                 READY   STATUS    RESTARTS   NODE</div><div className="term-line"><span className="term-cyan">api-gateway-7d8c9</span>   1/1     Running   0          ip-10-0-4-21</div><div className="term-line"><span className="term-cyan">payments-api-6fb4d</span>  1/1     Running   1          ip-10-0-7-14</div><div className="term-line"><span className="term-cyan">orders-api-79cc8</span>    1/1     Running   0          ip-10-0-4-21</div><div className="term-line"><span className="prompt">alex@kubeman</span><span className="term-muted">:commerce $ </span><span className="cmd">helm list</span></div><div className="term-line"><span className="term-amber">commerce-stack</span>   commerce   12   deployed   2.8.1</div>{terminalLines.map((line, i) => <div key={i} className={line.startsWith("$") ? "term-line cmd" : "term-line term-muted"}>{line}</div>)}<form className="terminal-input" onSubmit={runCommand}><span className="prompt">alex@kubeman</span><span className="term-muted">:commerce $</span><input value={command} onChange={(e) => setCommand(e.target.value)} aria-label="Terminal command" autoComplete="off" /></form></div>
-              </section>
-
-              <section className="pane">
-                <div className="pane-head"><span className="pane-title">Resource flow</span><span className="pane-subtitle">Live traffic · 30s</span><div className="pane-actions"><button className="tiny-btn" onClick={() => notify("Flow graph centered")}>◎</button><button className="tiny-btn">＋</button><button className="tiny-btn">−</button></div></div>
-                <div className="flow-canvas"><div className="flow-inner"><div className="flow-edge edge-1"/><div className="flow-edge edge-2"/><div className="flow-edge edge-3"/><div className="flow-edge edge-4"/><span className="traffic-pill pill-1">1.2k r/s</span><span className="traffic-pill pill-2">820 r/s</span><span className="traffic-pill pill-3">390 r/s</span>{[["ingress","public-ingress","Ingress","IN"],["service","api-gateway","Service","SVC"],["api-a","orders-api","Deployment","D"],["api-b","payments-api","Deployment","D"],["db","orders-db","StatefulSet","ST"]].map(([cls,name,type,icon]) => <button key={cls} className={`flow-node ${cls} ${selectedNode === cls ? "active" : ""}`} onClick={() => setSelectedNode(cls)}><strong>{name}</strong><span>{type}</span><i className="node-icon">{icon}</i></button>)}</div></div>
-              </section>
-
-              <section className="pane">
-                <div className="pane-head"><span className="pane-title">Events & history</span><span className="pane-subtitle">128 in the last hour</span><div className="pane-actions"><button className="tiny-btn" onClick={() => notify("Event stream paused")}>Ⅱ</button><button className="tiny-btn">⇩</button></div></div>
-                <div className="event-filters">{["All", "Warn", "Error"].map((filter) => <button key={filter} className={`filter-chip ${eventFilter === filter ? "active" : ""}`} onClick={() => setEventFilter(filter)}>{filter}</button>)}</div><div className="event-list">{filteredEvents.map(([time,type,title,detail]) => <div className="event" key={time}><span className="event-time">{time}</span><i className={`event-dot ${type}`} /><div className="event-text"><strong>{title}</strong><span>{detail}</span></div></div>)}</div>
-              </section>
+        <div className="workspace-bar">
+          <span className="crumb"><strong>Operations workspace</strong></span>
+          <span className="health"><i className="cluster-dot" /> {selectedClusterDetails?.status === "ACTIVE" || !selectedClusterDetails ? "Healthy" : selectedClusterDetails.status} {selectedClusterDetails ? `· EKS ${selectedClusterDetails.version}` : "· 24 nodes"}</span>
+          <span className="role-context" title={selectedClusterDetails?.assignedRoleArn ?? "Connect AWS credentials to discover the assigned role"}>Role: {selectedClusterDetails?.assignedRoleName ?? "not discovered"}</span>
+          <div className="workspace-tools">
+            <div className="widget-picker">
+              <button className="add-widget" aria-expanded={tileMenuOpen} onClick={() => setTileMenuOpen((open) => !open)}>＋ Add tile</button>
+              {tileMenuOpen && <div className="widget-menu"><div className="widget-menu-head"><strong>Add to workspace</strong><span>{visibleTiles.length} of {tileCatalog.length} active</span></div>{tileCatalog.map((tile) => {
+                const active = visibleTiles.includes(tile.id);
+                return <button key={tile.id} disabled={active} onClick={() => addTile(tile.id)}><span className="widget-icon">{tile.icon}</span><span><strong>{tile.name}</strong><small>{tile.description}</small></span><b>{active ? "Added" : "+"}</b></button>;
+              })}</div>}
             </div>
-          </>
-        ) : (
-          <AdminView onInvite={() => setModal("invite")} />
-        )}
+            {layout === 2 && <div className="layout-controls" aria-label="Split direction">
+            <button
+              title={`Change to ${splitDirection === "vertical" ? "horizontal" : "vertical"} split`}
+              aria-label={`Change to ${splitDirection === "vertical" ? "horizontal" : "vertical"} split`}
+              className={`layout-btn direction-toggle ${layout === 2 ? "active" : ""}`}
+              onClick={() => {
+                setSplitDirection((direction) => direction === "vertical" ? "horizontal" : "vertical");
+              }}
+            >{splitDirection === "vertical" ? "Ⅱ" : "＝"}</button>
+            </div>}
+          </div>
+        </div>
+
+        <div className={`workspace-grid layout-${layout} split-${splitDirection}`} style={gridStyle}>
+          {visibleTiles.includes("resources") &&
+          <Pane {...movementProps("resources")} id="resources" title="Kubernetes" subtitle={selectedCluster} collapsed={collapsed.has("resources")} toggle={togglePane} remove={removeTile} actions={<><div className="segmented">{["Workloads", "Network", "AWS infra"].map((scope) => <button key={scope} className={resourceScope === scope ? "active" : ""} onClick={() => setResourceScope(scope)}>{scope}</button>)}</div><button className="tiny-btn" onClick={() => notify(`Resources refreshed for ${selectedCluster}`)}>↻</button></>}>
+            {resourceScope === "AWS infra" ? <AwsInfrastructure cluster={selectedClusterDetails} openAdmin={() => setSection("admin")} /> : <>
+              <div className="resource-summary"><div className="summary-item"><strong>42</strong><span>Pods</span></div><div className="summary-item"><strong>18</strong><span>Deployments</span></div><div className="summary-item"><strong>12</strong><span>Services</span></div><div className="summary-item"><strong>99.8%</strong><span>Healthy</span></div></div>
+              <div className="resource-table"><div className="table-head"><span>Name</span><span>Status</span><span>CPU</span><span>Age</span></div>{resources.map(([name, kind, status, cpu, percent]) => <div className="table-row" key={name}><div className="resource-name"><span className="kind">{kind[0]}</span>{name}</div><span className="status-ok">{status}</span><span>{cpu}<div className="cpu-bar"><span style={{ width: percent }} /></div></span><span>{name.includes("redis") ? "12d" : "4h"}</span></div>)}</div>
+            </>}
+          </Pane>}
+
+          {visibleTiles.includes("terminal") &&
+          <Pane {...movementProps("terminal")} id="terminal" title="Terminal" subtitle={<><i className="live-dot" /> live · {selectedCluster}</>} terminal collapsed={collapsed.has("terminal")} toggle={togglePane} remove={removeTile} actions={<><span className="shell-badge">non-root</span><button className="tiny-btn" onClick={() => setShellRevision((revision) => revision + 1)}>↻</button></>}>
+            <div className="terminal-tabs"><span className="term-tab active">bash</span><span className="term-tool">kubectl</span><span className="term-tool">helm</span><span className="term-tool">aws</span></div>
+            <div className="terminal-live">{shellUrl ? <iframe className="terminal-frame" src={shellUrl} title="KubeMan live Bash terminal" allow="clipboard-read; clipboard-write" /> : <div className="terminal-loading">Connecting to shell…</div>}</div>
+          </Pane>}
+
+          {visibleTiles.includes("flow") &&
+          <Pane {...movementProps("flow")} id="flow" title="Resource flow" subtitle="Live traffic · 30s" collapsed={collapsed.has("flow")} toggle={togglePane} remove={removeTile} actions={<><button className="tiny-btn" onClick={() => notify("Flow graph centered")}>◎</button><button className="tiny-btn">＋</button><button className="tiny-btn">−</button></>}>
+            <div className="flow-canvas"><div className="flow-inner"><div className="flow-edge edge-1"/><div className="flow-edge edge-2"/><div className="flow-edge edge-3"/><div className="flow-edge edge-4"/><span className="traffic-pill pill-1">1.2k r/s</span><span className="traffic-pill pill-2">820 r/s</span><span className="traffic-pill pill-3">390 r/s</span>{[["ingress","public-ingress","Ingress","IN"],["service","api-gateway","Service","SVC"],["api-a","orders-api","Deployment","D"],["api-b","payments-api","Deployment","D"],["db","orders-db","StatefulSet","ST"]].map(([cls,name,type,icon]) => <button key={cls} className={`flow-node ${cls} ${selectedNode === cls ? "active" : ""}`} onClick={() => setSelectedNode(cls)}><strong>{name}</strong><span>{type}</span><i className="node-icon">{icon}</i></button>)}</div></div>
+          </Pane>}
+
+          {visibleTiles.includes("events") &&
+          <Pane {...movementProps("events")} id="events" title="Events & history" subtitle="128 in the last hour" collapsed={collapsed.has("events")} toggle={togglePane} remove={removeTile} actions={<><button className="tiny-btn" onClick={() => notify("Event stream paused")}>Ⅱ</button><button className="tiny-btn">⇩</button></>}>
+            <div className="event-filters">{["All", "Warn", "Error"].map((filter) => <button key={filter} className={`filter-chip ${eventFilter === filter ? "active" : ""}`} onClick={() => setEventFilter(filter)}>{filter}</button>)}</div><div className="event-list">{filteredEvents.map(([time,type,title,detail]) => <div className="event" key={time}><span className="event-time">{time}</span><i className={`event-dot ${type}`} /><div className="event-text"><strong>{title}</strong><span>{detail}</span></div></div>)}</div>
+          </Pane>}
+
+          {visibleTiles.length === 0 && <div className="empty-workspace"><span>＋</span><h2>Your workspace is empty</h2><p>Add a Kubernetes, terminal, flow, or events tile to begin.</p><button className="primary" onClick={() => setTileMenuOpen(true)}>Add your first tile</button></div>}
+
+          {(layout > 2 || (layout === 2 && splitDirection === "vertical")) && <button className="resize-handle resize-x" aria-label="Resize columns" onPointerDown={(event) => startResize("x", event)}><span /></button>}
+          {(layout === 4 || layout === 3 || (layout === 2 && splitDirection === "horizontal")) && <button className={`resize-handle resize-y ${layout === 3 ? "right-only" : ""}`} aria-label="Resize rows" onPointerDown={(event) => startResize("y", event)}><span /></button>}
+        </div>
       </main>
-      {modal && <Modal type={modal} close={() => setModal(null)} submit={() => { setModal(null); notify(modal === "invite" ? "Invitation queued" : "Cluster connection saved"); }} />}
+
+      {modal && <Modal type={modal} close={() => setModal(null)} submit={modalDone} />}
       {toast && <div className="toast">✓&nbsp;&nbsp;{toast}</div>}
     </div>
   );
 }
 
-function AdminView({ onInvite }: { onInvite: () => void }) {
-  return <div className="admin-page"><div className="admin-titlebar"><div><h1>Workspace administration</h1><p>Manage members, access boundaries and saved cluster connections.</p></div><button className="primary" onClick={onInvite}>+ Invite member</button></div><div className="stat-grid"><div className="stat-card"><span>Active members</span><strong>24</strong></div><div className="stat-card"><span>Connected clusters</span><strong>8</strong></div><div className="stat-card"><span>Saved profiles</span><strong>31</strong></div><div className="stat-card"><span>Audit events · 7d</span><strong>1,284</strong></div></div><div className="admin-card"><div className="admin-card-head"><strong>Members</strong><span>24 people with workspace access</span></div><div className="members-table"><div className="member-row header"><span>User</span><span>Role</span><span>Access</span><span>Last active</span><span/></div>{members.map(([name,email,role,access,last]) => <div className="member-row" key={email}><div className="member"><div className="avatar">{name.split(" ").map((part) => part[0]).join("")}</div><div><strong>{name}</strong><span>{email}</span></div></div><span className={`role ${role === "Admin" ? "admin" : ""}`}>{role}</span><span>{access}</span><span>{last}</span><button className="tiny-btn">•••</button></div>)}</div></div></div>;
+function Pane({ id, title, subtitle, collapsed, toggle, remove, actions, terminal, children, position, total, dragging, move, dragStart, dragEnd, drop }: { id: PaneId; title: string; subtitle: React.ReactNode; collapsed: boolean; toggle: (id: PaneId) => void; remove: (id: PaneId) => void; actions: React.ReactNode; terminal?: boolean; children: React.ReactNode; position: number; total: number; dragging: boolean; move: (id: PaneId, change: -1 | 1) => void; dragStart: (event: ReactDragEvent<HTMLElement>) => void; dragEnd: () => void; drop: () => void }) {
+  return <section style={{ order: position }} className={`pane pane-position-${position} ${terminal ? "terminal-pane" : ""} ${collapsed ? "pane-collapsed" : ""} ${dragging ? "pane-dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => { event.preventDefault(); drop(); }}><div className="pane-head"><span className="tile-drag" draggable onDragStart={dragStart} onDragEnd={dragEnd} role="button" tabIndex={0} aria-label={`Drag ${title} tile to a new position`} title="Drag to move tile">⠿</span><button className="pane-fold" onClick={() => toggle(id)} aria-label={`${collapsed ? "Expand" : "Collapse"} ${title}`}>{collapsed ? "›" : "⌄"}</button><span className="pane-title">{title}</span><span className="pane-subtitle">{subtitle}</span><div className="pane-actions"><span className="tile-move-controls"><button disabled={position <= 0} onClick={() => move(id, -1)} aria-label={`Move ${title} to previous position`} title="Move to previous position">←</button><button disabled={position >= total - 1} onClick={() => move(id, 1)} aria-label={`Move ${title} to next position`} title="Move to next position">→</button></span>{actions}<button className="tiny-btn pane-remove" onClick={() => remove(id)} aria-label={`Remove ${title} tile`}>×</button></div></div><div className="pane-content">{children}</div></section>;
 }
 
-function Modal({ type, close, submit }: { type: "cluster" | "invite"; close: () => void; submit: () => void }) {
-  const invite = type === "invite";
-  return <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && close()}><div className="modal" role="dialog" aria-modal="true" aria-label={invite ? "Invite member" : "Connect cluster"}><div className="modal-head"><div><h2>{invite ? "Invite a member" : "Connect a cluster"}</h2><p>{invite ? "Grant workspace access with a controlled role." : "Kubeconfig secrets are encrypted and never shown after saving."}</p></div><button className="close" onClick={close}>×</button></div><div className="modal-body">{invite ? <><div className="field"><label>Email address</label><input placeholder="operator@company.com" /></div><div className="field"><label>Role</label><select defaultValue="Operator"><option>Operator</option><option>Viewer</option><option>Admin</option></select></div><div className="field"><label>Cluster access</label><select defaultValue="Selected clusters"><option>Selected clusters</option><option>All clusters</option><option>Staging only</option></select></div></> : <><div className="field"><label>Connection name</label><input defaultValue="production-us-east-1" /></div><div className="dropzone"><strong>Choose kubeconfig file</strong>or drop it here · YAML up to 1 MB</div><div className="field"><label>Credential profile</label><select defaultValue="Use kubeconfig credentials"><option>Use kubeconfig credentials</option><option>AWS IAM role</option><option>Existing workspace secret</option></select></div></>} </div><div className="modal-foot"><button className="secondary" onClick={close}>Cancel</button><button className="primary" onClick={submit}>{invite ? "Send invitation" : "Save connection"}</button></div></div></div>;
+function PaletteControl({ palette, open, setOpen, choose }: { palette: string; open: boolean; setOpen: (open: boolean) => void; choose: (palette: string) => void }) {
+  return <div className="palette-wrap"><button className="icon-btn palette-trigger" aria-label="Change color palette" aria-expanded={open} onClick={() => setOpen(!open)}><span className={`palette-swatch ${palette}`} /></button>{open && <div className="palette-menu" role="menu">{[["forest", "Forest"], ["ocean", "Ocean"], ["ember", "Ember"], ["violet", "Violet"]].map(([value, label]) => <button key={value} role="menuitem" className={palette === value ? "active" : ""} onClick={() => choose(value)}><span className={`palette-swatch ${value}`} /><span>{label}</span>{palette === value && <b>✓</b>}</button>)}</div>}</div>;
 }
+
+function AdminHeader({ user, palette, paletteOpen, setPaletteOpen, choosePalette, onBack }: { user: User; palette: string; paletteOpen: boolean; setPaletteOpen: (open: boolean) => void; choosePalette: (palette: string) => void; onBack: () => void }) {
+  return <header className="admin-topbar"><div className="brand"><div className="brand-mark">KM</div><span>KubeMan</span></div><span className="admin-divider"/><strong className="admin-product">Administration</strong><div className="top-actions"><PaletteControl palette={palette} open={paletteOpen} setOpen={setPaletteOpen} choose={choosePalette}/><div className="avatar" title={user.email}>{initials(user.name)}</div><button className="secondary back-console" onClick={onBack}>← Kubernetes console</button></div></header>;
+}
+
+function AwsInfrastructure({ cluster, openAdmin }: { cluster?: AwsCluster; openAdmin: () => void }) {
+  if (!cluster) return <div className="infra-empty"><span>AWS</span><strong>No AWS infrastructure discovered yet</strong><p>Add an AWS profile or credentials in Administration to pull EKS, VPC, subnet, endpoint IP, security group, and role details.</p><button className="primary" onClick={openAdmin}>Open AWS credentials</button></div>;
+  return <div className="infra-view">
+    <div className="infra-identity"><div><span>Authenticated role</span><strong title={cluster.assignedRoleArn}>{cluster.assignedRoleName}</strong><small>{cluster.assignedRoleArn}</small></div><b>{cluster.accountId} · {cluster.region}</b></div>
+    <div className="infra-summary"><InfraMetric label="VPC" value={cluster.vpc.VpcId || "—"} detail={cluster.vpc.CidrBlock || "CIDR unavailable"}/><InfraMetric label="Subnets" value={String(cluster.subnets.length)} detail={`${new Set(cluster.subnets.map((subnet) => subnet.AvailabilityZone)).size} availability zones`}/><InfraMetric label="Endpoint IPs" value={String(cluster.endpointIps.length)} detail={cluster.endpointPrivateAccess ? "Private access enabled" : "Public endpoint"}/><InfraMetric label="Security groups" value={String(cluster.securityGroups.length)} detail={`Service CIDR ${cluster.networkConfig.serviceIpv4Cidr || cluster.networkConfig.serviceIpv6Cidr || "—"}`}/></div>
+    <div className="infra-columns"><section><h4>Subnets</h4>{cluster.subnets.map((subnet) => <div className="infra-row" key={subnet.SubnetId}><div><strong>{subnet.SubnetId}</strong><span>{subnet.AvailabilityZone} · {subnet.CidrBlock}</span></div><b>{subnet.AvailableIpAddressCount?.toLocaleString() ?? "—"} IPs</b></div>)}</section><section><h4>Security groups & endpoint</h4>{cluster.securityGroups.map((group) => <div className="infra-row" key={group.GroupId}><div><strong>{group.GroupName || group.GroupId}</strong><span>{group.GroupId} · {group.Description}</span></div></div>)}<div className="endpoint-card"><strong>{cluster.endpointPrivateAccess ? "Private" : "Public"} Kubernetes API</strong><span>{cluster.endpoint}</span><small>{cluster.endpointIps.join(" · ") || "Endpoint IPs resolve inside the connected network"}</small></div></section></div>
+  </div>;
+}
+
+function InfraMetric({ label, value, detail }: { label: string; value: string; detail: string }) { return <div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>; }
+
+function AdminView({ cluster, clusters, onInvite, onCredential, onBastion, notify }: { cluster: string; clusters: AwsCluster[]; onInvite: () => void; onCredential: () => void; onBastion: () => void; notify: (message: string) => void }) {
+  return <main className="admin-page admin-standalone"><div className="admin-titlebar"><div><span className="admin-kicker">Organization controls</span><h1>Workspace administration</h1><p>Identity, credentials, retention, and storage—separate from day-to-day cluster operations.</p></div><button className="primary" onClick={onInvite}>+ Invite member</button></div><div className="stat-grid admin-stats"><div className="stat-card"><span>Active members</span><strong>24</strong><small>3 administrators</small></div><div className="stat-card"><span>Discovered EKS clusters</span><strong>{clusters.length}</strong><small>{clusters.length ? `${new Set(clusters.map((item) => item.accountId)).size} AWS account${new Set(clusters.map((item) => item.accountId)).size === 1 ? "" : "s"}` : "Connect AWS to discover"}</small></div><div className="stat-card"><span>Encrypted storage</span><strong>2.4 GB</strong><small>Healthy</small></div><div className="stat-card"><span>Audit retention</span><strong>90 days</strong><small>1,284 events</small></div></div><div className="admin-sections">
+    <details className="admin-card admin-fold" open><summary><div><strong>Users & access</strong><span>Membership, roles, environment boundaries, and invitations</span></div><b>24 members</b></summary><div className="admin-card-body"><div className="section-actions"><input className="admin-search" placeholder="Search members…"/><button className="secondary" onClick={onInvite}>Invite member</button></div><div className="members-table"><div className="member-row header"><span>User</span><span>Role</span><span>Scope</span><span>Last active</span><span/></div>{members.map(([name,email,role,access,last]) => <div className="member-row" key={email}><div className="member"><div className="avatar">{initials(name)}</div><div><strong>{name}</strong><span>{email}</span></div></div><span className={`role ${role === "Admin" ? "admin" : ""}`}>{role}</span><span>{access}</span><span>{last}</span><button className="tiny-btn">•••</button></div>)}</div></div></details>
+    <details className="admin-card admin-fold" open><summary><div><strong>AWS credential vault & EKS discovery</strong><span>Connect a mounted profile or temporary credentials, then pull clusters and infrastructure</span></div><b>{clusters.length ? `${clusters.length} clusters` : "Not connected"}</b></summary><div className="admin-card-body"><div className="vault-notice"><span>◆</span><div><strong>Discover without storing raw secret values</strong><p>Access keys are used only for the discovery request. Cluster details and the assigned role are saved persistently.</p></div><button className="primary" onClick={onCredential}>{clusters.length ? "Refresh discovery" : "+ Connect & discover"}</button></div>{clusters.length ? <div className="discovered-clusters">{clusters.map((item) => <div className="discovered-cluster" key={`${item.region}:${item.name}`}><div className="credential-icon">EKS</div><div><strong>{item.name}</strong><span>{item.region} · Kubernetes {item.version} · {item.vpc.VpcId}</span><small title={item.assignedRoleArn}>Role: {item.assignedRoleName}</small></div><em className="healthy">{item.status}</em></div>)}</div> : <div className="credential-grid">{credentials.slice(0, 1).map(([name,type,account,status,rotated]) => <div className="credential-card muted-card" key={name}><div className="credential-icon">AWS</div><div><strong>Example: {name}</strong><span>{type} · account {account}</span><small>Connect credentials to replace this example</small></div><em className="healthy">{status}</em><button className="tiny-btn">•••</button></div>)}</div>}</div></details>
+    <details className="admin-card admin-fold"><summary><div><strong>EKS connectivity</strong><span>Bastion and AWS Systems Manager tunnels for private Kubernetes API endpoints</span></div><b>No tunnel configured</b></summary><div className="admin-card-body"><div className="bastion-layout"><div className="bastion-visual"><span className="bastion-node">KM</span><i/><span className="bastion-node gateway">SSH</span><i/><span className="bastion-node eks">EKS</span></div><div className="bastion-copy"><strong>Connect {cluster} through a private path</strong><p>Create an SSH local-forward or Session Manager tunnel. KubeMan keeps the key or AWS profile as an encrypted reference and applies the EKS TLS server name automatically.</p><div className="bastion-features"><span>✓ SSH bastion</span><span>✓ SSM Session Manager</span><span>✓ Automatic reconnect</span><span>✓ Health checks</span></div></div><div className="bastion-actions"><button className="primary" onClick={onBastion}>+ Add bastion tunnel</button><button className="secondary" onClick={() => notify("No tunnel profile to test yet")}>Test connection</button></div></div></div></details>
+    <details className="admin-card admin-fold"><summary><div><strong>Storage & persistence</strong><span>Application state, terminal homes, kubeconfigs, backups, and retention</span></div><b>All systems healthy</b></summary><div className="admin-card-body"><div className="storage-grid"><StorageRow name="Workspace database" detail="Users, roles, saved views, and audit metadata" value="48 MB" status="Encrypted"/><StorageRow name="Terminal home volumes" detail="Shell profiles, history, and user workspace files" value="1.8 GB" status="Persistent"/><StorageRow name="Kubeconfig references" detail="Read-only mounts and encrypted connection metadata" value="8 files" status="Protected"/><StorageRow name="Audit archive" detail="Immutable activity records · 90-day retention" value="612 MB" status="Backed up"/></div><div className="storage-foot"><span>Last backup completed today at 03:20 · next scheduled in 15 hours</span><button className="secondary" onClick={() => notify("Storage integrity check queued")}>Run integrity check</button></div></div></details>
+  </div></main>;
+}
+
+function StorageRow({ name, detail, value, status }: { name: string; detail: string; value: string; status: string }) {
+  return <div className="storage-row"><span className="storage-icon">▤</span><div><strong>{name}</strong><span>{detail}</span></div><b>{value}</b><em>{status}</em><button className="tiny-btn">•••</button></div>;
+}
+
+function Modal({ type, close, submit }: { type: ModalType; close: () => void; submit: (input?: AwsCredentialInput) => Promise<void> | void }) {
+  const invite = type === "invite";
+  const bastion = type === "bastion";
+  const credential = type === "credential";
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const title = invite ? "Invite a member" : bastion ? "Add bastion tunnel" : "Add AWS credentials";
+  const description = invite ? "Grant workspace access with a controlled role." : bastion ? "Create a protected route to the private EKS Kubernetes API." : "Validate AWS access, discover EKS clusters, and save their infrastructure and assigned role.";
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const input = credential ? {
+      profile: String(form.get("profile") ?? ""), region: String(form.get("region") ?? "us-east-1"),
+      roleArn: String(form.get("roleArn") ?? ""), accessKeyId: String(form.get("accessKeyId") ?? ""),
+      secretAccessKey: String(form.get("secretAccessKey") ?? ""), sessionToken: String(form.get("sessionToken") ?? ""),
+    } : undefined;
+    setBusy(true); setError("");
+    try { await submit(input); } catch (failure) { setError(failure instanceof Error ? failure.message : "Request failed"); setBusy(false); }
+  }
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}><form className={`modal ${bastion || credential ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title} onSubmit={handleSubmit}><div className="modal-head"><div><h2>{title}</h2><p>{description}</p></div><button type="button" className="close" onClick={close}>×</button></div><div className="modal-body">{invite ? <><Field label="Email address"><input placeholder="operator@company.com"/></Field><Field label="Role"><select defaultValue="Operator"><option>Operator</option><option>Viewer</option><option>Admin</option></select></Field><Field label="Environment access"><select defaultValue="Selected environments"><option>Selected environments</option><option>All environments</option><option>Read only</option></select></Field></> : bastion ? <><div className="field-grid"><Field label="Tunnel name"><input defaultValue="production-eks-bastion"/></Field><Field label="Tunnel method"><select defaultValue="SSH local forward"><option>SSH local forward</option><option>AWS SSM Session Manager</option></select></Field></div><Field label="Private EKS endpoint"><input placeholder="https://ABCDEF.gr7.us-east-1.eks.amazonaws.com"/></Field><div className="field-grid"><Field label="Bastion host"><input placeholder="bastion.internal.example.com"/></Field><Field label="SSH port"><input defaultValue="22" inputMode="numeric"/></Field></div><div className="field-grid"><Field label="SSH user"><input defaultValue="ec2-user"/></Field><Field label="Authentication reference"><select defaultValue="Mounted SSH agent"><option>Mounted SSH agent</option><option>Encrypted private key</option><option>AWS credential profile</option></select></Field></div><div className="field-grid"><Field label="Local port"><input defaultValue="6443" inputMode="numeric"/></Field><Field label="TLS server name"><input placeholder="ABCDEF.gr7.us-east-1.eks.amazonaws.com"/></Field></div><label className="check-row"><input type="checkbox" defaultChecked/><span>Automatically reconnect and health-check this tunnel</span></label></> : <><div className="discovery-note"><strong>Use a mounted profile or temporary access keys</strong><span>Leave access keys empty to use the selected profile from your Mac. Raw keys are never written to disk.</span></div><div className="field-grid"><Field label="Mounted AWS profile"><input name="profile" defaultValue="default" placeholder="default" autoComplete="off"/></Field><Field label="Region"><input name="region" defaultValue="us-east-1" placeholder="us-east-1 or all" autoComplete="off"/></Field></div><Field label="Assume role ARN (optional)"><input name="roleArn" placeholder="arn:aws:iam::123456789012:role/KubeMan" autoComplete="off"/></Field><div className="field-grid"><Field label="Access key ID (optional)"><input name="accessKeyId" autoComplete="off"/></Field><Field label="Secret access key (optional)"><input name="secretAccessKey" type="password" autoComplete="new-password"/></Field></div><Field label="Session token (optional)"><input name="sessionToken" type="password" autoComplete="new-password"/></Field></>}{error && <div className="modal-error">{error}</div>}</div><div className="modal-foot"><button type="button" className="secondary" onClick={close} disabled={busy}>Cancel</button><button type="submit" className="primary" disabled={busy}>{busy ? "Discovering AWS…" : invite ? "Send invitation" : bastion ? "Validate & save tunnel" : "Connect & discover clusters"}</button></div></form></div>;
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) { return <div className="field"><label>{label}</label>{children}</div>; }
+function initials(name: string) { return name.split(" ").map((part) => part[0]).join("").slice(0, 2); }
