@@ -1,0 +1,64 @@
+# KubeMan gateway: one origin for the console, identity API, AWS discovery and
+# the terminal. Shell and AWS routes are gated by the identity service, which
+# checks the session cookie and the required permission.
+{
+	admin off
+	servers {
+		# Honor X-Forwarded-Proto/Host from a TLS terminator on a private
+		# network (ALB, nginx, Cloudflare Tunnel, ...). Requests arriving
+		# directly from public addresses get these headers overwritten.
+		# Setting KUBEMAN_PUBLIC_URL makes the public address explicit.
+		trusted_proxies static private_ranges
+	}
+	# Set KUBEMAN_SITE_ADDRESS to a domain name to get automatic HTTPS.
+	# The default (:80) serves plain HTTP behind whatever exposes the port.
+}
+
+{$KUBEMAN_SITE_ADDRESS::80} {
+	encode zstd gzip
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	# Identity: init, session, users, roles, audit and Google OAuth callbacks.
+	@identity path /status /session /initialize /logout /auth/* /api/*
+	handle @identity {
+		reverse_proxy kubeman-bootstrap:7683
+	}
+
+	# Terminal (ttyd serves under this base path, websocket included).
+	handle /_km/shell/* {
+		forward_auth kubeman-bootstrap:7683 {
+			uri /auth/check?permission=terminal:use
+		}
+		reverse_proxy kubeman-shell:7681
+	}
+
+	# AWS discovery. Reading discovered clusters and running discovery differ.
+	handle /_km/aws/discover {
+		forward_auth kubeman-bootstrap:7683 {
+			uri /auth/check?permission=credentials:manage
+		}
+		uri strip_prefix /_km/aws
+		reverse_proxy kubeman-aws:7682
+	}
+	handle /_km/aws/clusters {
+		forward_auth kubeman-bootstrap:7683 {
+			uri /auth/check?permission=clusters:view
+		}
+		uri strip_prefix /_km/aws
+		reverse_proxy kubeman-aws:7682
+	}
+
+	# Anything else under /_km is not exposed.
+	handle /_km/* {
+		respond "Not found" 404
+	}
+
+	handle {
+		reverse_proxy kubeman:3000
+	}
+}

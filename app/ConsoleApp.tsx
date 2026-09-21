@@ -2,8 +2,10 @@
 
 import { type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from "react";
 
-type User = { name: string; email: string; isAdmin: boolean };
-type ModalType = "invite" | "credential" | "bastion";
+import { ADMIN_PERMISSIONS, type User, api, can } from "./api";
+import { AuditPanel, InviteModal, RolesPanel, UsersPanel, useAccess } from "./AccessAdmin";
+
+type ModalType = "credential" | "bastion";
 type PaneId = "resources" | "terminal" | "flow" | "events";
 type AwsCredentialInput = { profile: string; region: string; roleArn: string; accessKeyId: string; secretAccessKey: string; sessionToken: string };
 type AwsCluster = {
@@ -17,11 +19,11 @@ type AwsCluster = {
   networkConfig: { ipFamily?: string; serviceIpv4Cidr?: string; serviceIpv6Cidr?: string };
 };
 
-const tileCatalog: { id: PaneId; name: string; description: string; icon: string }[] = [
-  { id: "resources", name: "Kubernetes resources", description: "Workloads, services, and health", icon: "K8" },
-  { id: "terminal", name: "Live terminal", description: "Bash, kubectl, Helm, and AWS", icon: ">_" },
-  { id: "flow", name: "Resource flow", description: "Topology and live traffic paths", icon: "⌘" },
-  { id: "events", name: "Events & history", description: "Warnings, changes, and audit trail", icon: "◷" },
+const tileCatalog: { id: PaneId; name: string; description: string; icon: string; permission: string }[] = [
+  { id: "resources", name: "Kubernetes resources", description: "Workloads, services, and health", icon: "K8", permission: "resources:view" },
+  { id: "terminal", name: "Live terminal", description: "Bash, kubectl, Helm, and AWS", icon: ">_", permission: "terminal:use" },
+  { id: "flow", name: "Resource flow", description: "Topology and live traffic paths", icon: "⌘", permission: "resources:view" },
+  { id: "events", name: "Events & history", description: "Warnings, changes, and audit trail", icon: "◷", permission: "events:view" },
 ];
 
 const resources = [
@@ -40,13 +42,6 @@ const events = [
   ["10:34:40", "ok", "Created pod", "orders-api-79cc8 · node ip-10-0-4-21"],
 ];
 
-const members = [
-  ["Alex Morgan", "alex@acme.dev", "Admin", "All environments", "Just now"],
-  ["Maya Chen", "maya@acme.dev", "Operator", "Production", "18 min ago"],
-  ["Sam Rivera", "sam@acme.dev", "Viewer", "Read only", "Yesterday"],
-  ["Noah Williams", "noah@acme.dev", "Operator", "Selected groups", "Aug 5"],
-];
-
 const credentials = [
   ["production-eks", "AWS IAM role", "1234 5678 9012", "Healthy", "Aug 2, 2026"],
   ["staging-eks", "Access key", "2345 6789 0123", "Rotate soon", "May 18, 2026"],
@@ -57,7 +52,9 @@ const exampleCluster = "production-us-east-1";
 
 export default function ConsoleApp({ user }: { user: User }) {
   const [section, setSection] = useState<"workspace" | "admin">("workspace");
-  const [visibleTiles, setVisibleTiles] = useState<PaneId[]>(["resources", "terminal", "flow", "events"]);
+  const [chosenTiles, setVisibleTiles] = useState<PaneId[]>(["resources", "terminal", "flow", "events"]);
+  // Tiles the signed-in user has no permission for are never shown or loaded.
+  const visibleTiles = useMemo(() => chosenTiles.filter((id) => can(user, tileCatalog.find((tile) => tile.id === id)?.permission ?? "")), [chosenTiles, user]);
   const [splitDirection, setSplitDirection] = useState<"vertical" | "horizontal">("vertical");
   const [splitX, setSplitX] = useState(54);
   const [splitY, setSplitY] = useState(50);
@@ -91,16 +88,17 @@ export default function ConsoleApp({ user }: { user: User }) {
         if (order.length && order.every((tile) => tileCatalog.some((item) => item.id === tile))) setVisibleTiles(order);
       } catch { /* Ignore malformed device-local layout preferences. */ }
     }
-    setShellBaseUrl(`${window.location.protocol}//${window.location.hostname}:7681/`);
-    fetch(`${window.location.protocol}//${window.location.hostname}:7682/clusters`)
-      .then((response) => response.ok ? response.json() : Promise.reject())
-      .then((data: { clusters?: AwsCluster[] }) => {
-        const discovered = data.clusters ?? [];
-        setAwsClusters(discovered);
-        if (discovered.length) setSelectedCluster(discovered[0].name);
-      })
-      .catch(() => undefined);
-  }, []);
+    if (can(user, "terminal:use")) setShellBaseUrl("/_km/shell/");
+    if (can(user, "clusters:view")) {
+      api<{ clusters?: AwsCluster[] }>("/_km/aws/clusters")
+        .then((data) => {
+          const discovered = data.clusters ?? [];
+          setAwsClusters(discovered);
+          if (discovered.length) setSelectedCluster(discovered[0].name);
+        })
+        .catch(() => undefined);
+    }
+  }, [user]);
 
   const clusterNames = awsClusters.length ? awsClusters.map((cluster) => cluster.name) : [exampleCluster];
   const selectedClusterDetails = awsClusters.find((cluster) => cluster.name === selectedCluster);
@@ -108,6 +106,11 @@ export default function ConsoleApp({ user }: { user: User }) {
   const shellUrl = useMemo(() => shellBaseUrl
     ? `${shellBaseUrl}?arg=${encodeURIComponent(selectedCluster)}&r=${shellRevision}`
     : "", [selectedCluster, shellBaseUrl, shellRevision]);
+
+  async function signOut() {
+    try { await api("/logout", { method: "POST" }); } catch { /* Session may already be gone. */ }
+    window.location.assign("/");
+  }
 
   function notify(message: string) {
     setToast(message);
@@ -198,13 +201,7 @@ export default function ConsoleApp({ user }: { user: User }) {
 
   async function modalDone(input?: AwsCredentialInput) {
     if (modal === "credential" && input) {
-      const response = await fetch(`${window.location.protocol}//${window.location.hostname}:7682/discover`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
-      });
-      const result = await response.json() as { clusters?: AwsCluster[]; error?: string };
-      if (!response.ok) throw new Error(result.error || "AWS cluster discovery failed");
+      const result = await api<{ clusters?: AwsCluster[] }>("/_km/aws/discover", { method: "POST", body: input });
       const discovered = result.clusters ?? [];
       setAwsClusters(discovered);
       if (discovered.length) {
@@ -215,16 +212,15 @@ export default function ConsoleApp({ user }: { user: User }) {
       notify(discovered.length ? `${discovered.length} EKS cluster${discovered.length === 1 ? "" : "s"} discovered` : "AWS connected — no EKS clusters found in this scope");
       return;
     }
-    const message = modal === "invite" ? "Invitation queued" : "Bastion tunnel profile saved";
     setModal(null);
-    notify(message);
+    notify("Bastion tunnel profile saved");
   }
 
   if (section === "admin") {
     return (
       <div className="admin-app" data-palette={palette}>
-        <AdminHeader user={user} palette={palette} paletteOpen={paletteOpen} setPaletteOpen={setPaletteOpen} choosePalette={choosePalette} onBack={() => setSection("workspace")} />
-        <AdminView cluster={selectedCluster} clusters={awsClusters} onInvite={() => setModal("invite")} onCredential={() => setModal("credential")} onBastion={() => setModal("bastion")} notify={notify} />
+        <AdminHeader signOut={signOut} user={user} palette={palette} paletteOpen={paletteOpen} setPaletteOpen={setPaletteOpen} choosePalette={choosePalette} onBack={() => setSection("workspace")} />
+        <AdminView user={user} cluster={selectedCluster} clusters={awsClusters} onCredential={() => setModal("credential")} onBastion={() => setModal("bastion")} notify={notify} />
         {modal && <Modal type={modal} close={() => setModal(null)} submit={modalDone} />}
         {toast && <div className="toast">✓&nbsp;&nbsp;{toast}</div>}
       </div>
@@ -272,7 +268,7 @@ export default function ConsoleApp({ user }: { user: User }) {
           <button className="icon-btn" aria-label="Notifications" onClick={() => setEventFilter("Warn")}>◔</button>
           <button className="icon-btn" aria-label="Help" onClick={() => notify("KubeMan help center will open here")}>?</button>
           <div className="avatar" title={user.email}>{initials(user.name)}</div>
-          {user.isAdmin && <button className="admin-entry" onClick={() => setSection("admin")}>Admin</button>}
+          {ADMIN_PERMISSIONS.some((permission) => can(user, permission)) && <button className="admin-entry" onClick={() => setSection("admin")}>Admin</button>}<button className="admin-entry" onClick={signOut}>Sign out</button>
         </div>
       </header>
 
@@ -284,9 +280,9 @@ export default function ConsoleApp({ user }: { user: User }) {
           <div className="workspace-tools">
             <div className="widget-picker">
               <button className="add-widget" aria-expanded={tileMenuOpen} onClick={() => setTileMenuOpen((open) => !open)}>＋ Add tile</button>
-              {tileMenuOpen && <div className="widget-menu"><div className="widget-menu-head"><strong>Add to workspace</strong><span>{visibleTiles.length} of {tileCatalog.length} active</span></div>{tileCatalog.map((tile) => {
+              {tileMenuOpen && <div className="widget-menu"><div className="widget-menu-head"><strong>Add to workspace</strong><span>{visibleTiles.length} of {tileCatalog.filter((tile) => can(user, tile.permission)).length} active</span></div>{tileCatalog.map((tile) => {
                 const active = visibleTiles.includes(tile.id);
-                return <button key={tile.id} disabled={active} onClick={() => addTile(tile.id)}><span className="widget-icon">{tile.icon}</span><span><strong>{tile.name}</strong><small>{tile.description}</small></span><b>{active ? "Added" : "+"}</b></button>;
+                return <button key={tile.id} disabled={active || !can(user, tile.permission)} title={can(user, tile.permission) ? undefined : "Your role does not include this tile"} onClick={() => addTile(tile.id)}><span className="widget-icon">{tile.icon}</span><span><strong>{tile.name}</strong><small>{tile.description}</small></span><b>{active ? "Added" : can(user, tile.permission) ? "+" : "🔒"}</b></button>;
               })}</div>}
             </div>
             {layout === 2 && <div className="layout-controls" aria-label="Split direction">
@@ -348,8 +344,8 @@ function PaletteControl({ palette, open, setOpen, choose }: { palette: string; o
   return <div className="palette-wrap"><button className="icon-btn palette-trigger" aria-label="Change color palette" aria-expanded={open} onClick={() => setOpen(!open)}><span className={`palette-swatch ${palette}`} /></button>{open && <div className="palette-menu" role="menu">{[["forest", "Forest"], ["ocean", "Ocean"], ["ember", "Ember"], ["violet", "Violet"]].map(([value, label]) => <button key={value} role="menuitem" className={palette === value ? "active" : ""} onClick={() => choose(value)}><span className={`palette-swatch ${value}`} /><span>{label}</span>{palette === value && <b>✓</b>}</button>)}</div>}</div>;
 }
 
-function AdminHeader({ user, palette, paletteOpen, setPaletteOpen, choosePalette, onBack }: { user: User; palette: string; paletteOpen: boolean; setPaletteOpen: (open: boolean) => void; choosePalette: (palette: string) => void; onBack: () => void }) {
-  return <header className="admin-topbar"><div className="brand"><div className="brand-mark">KM</div><span>KubeMan</span></div><span className="admin-divider"/><strong className="admin-product">Administration</strong><div className="top-actions"><PaletteControl palette={palette} open={paletteOpen} setOpen={setPaletteOpen} choose={choosePalette}/><div className="avatar" title={user.email}>{initials(user.name)}</div><button className="secondary back-console" onClick={onBack}>← Kubernetes console</button></div></header>;
+function AdminHeader({ user, palette, paletteOpen, setPaletteOpen, choosePalette, onBack, signOut }: { user: User; signOut: () => void; palette: string; paletteOpen: boolean; setPaletteOpen: (open: boolean) => void; choosePalette: (palette: string) => void; onBack: () => void }) {
+  return <header className="admin-topbar"><div className="brand"><div className="brand-mark">KM</div><span>KubeMan</span></div><span className="admin-divider"/><strong className="admin-product">Administration</strong><div className="top-actions"><PaletteControl palette={palette} open={paletteOpen} setOpen={setPaletteOpen} choose={choosePalette}/><div className="avatar" title={user.email}>{initials(user.name)}</div><button className="secondary back-console" onClick={signOut}>Sign out</button><button className="secondary back-console" onClick={onBack}>← Kubernetes console</button></div></header>;
 }
 
 function AwsInfrastructure({ cluster, openAdmin }: { cluster?: AwsCluster; openAdmin: () => void }) {
@@ -363,13 +359,20 @@ function AwsInfrastructure({ cluster, openAdmin }: { cluster?: AwsCluster; openA
 
 function InfraMetric({ label, value, detail }: { label: string; value: string; detail: string }) { return <div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>; }
 
-function AdminView({ cluster, clusters, onInvite, onCredential, onBastion, notify }: { cluster: string; clusters: AwsCluster[]; onInvite: () => void; onCredential: () => void; onBastion: () => void; notify: (message: string) => void }) {
-  return <main className="admin-page admin-standalone"><div className="admin-titlebar"><div><span className="admin-kicker">Organization controls</span><h1>Workspace administration</h1><p>Identity, credentials, retention, and storage—separate from day-to-day cluster operations.</p></div><button className="primary" onClick={onInvite}>+ Invite member</button></div><div className="stat-grid admin-stats"><div className="stat-card"><span>Active members</span><strong>24</strong><small>3 administrators</small></div><div className="stat-card"><span>Discovered EKS clusters</span><strong>{clusters.length}</strong><small>{clusters.length ? `${new Set(clusters.map((item) => item.accountId)).size} AWS account${new Set(clusters.map((item) => item.accountId)).size === 1 ? "" : "s"}` : "Connect AWS to discover"}</small></div><div className="stat-card"><span>Encrypted storage</span><strong>2.4 GB</strong><small>Healthy</small></div><div className="stat-card"><span>Audit retention</span><strong>90 days</strong><small>1,284 events</small></div></div><div className="admin-sections">
-    <details className="admin-card admin-fold" open><summary><div><strong>Users & access</strong><span>Membership, roles, environment boundaries, and invitations</span></div><b>24 members</b></summary><div className="admin-card-body"><div className="section-actions"><input className="admin-search" placeholder="Search members…"/><button className="secondary" onClick={onInvite}>Invite member</button></div><div className="members-table"><div className="member-row header"><span>User</span><span>Role</span><span>Scope</span><span>Last active</span><span/></div>{members.map(([name,email,role,access,last]) => <div className="member-row" key={email}><div className="member"><div className="avatar">{initials(name)}</div><div><strong>{name}</strong><span>{email}</span></div></div><span className={`role ${role === "Admin" ? "admin" : ""}`}>{role}</span><span>{access}</span><span>{last}</span><button className="tiny-btn">•••</button></div>)}</div></div></details>
-    <details className="admin-card admin-fold" open><summary><div><strong>AWS credential vault & EKS discovery</strong><span>Connect a mounted profile or temporary credentials, then pull clusters and infrastructure</span></div><b>{clusters.length ? `${clusters.length} clusters` : "Not connected"}</b></summary><div className="admin-card-body"><div className="vault-notice"><span>◆</span><div><strong>Discover without storing raw secret values</strong><p>Access keys are used only for the discovery request. Cluster details and the assigned role are saved persistently.</p></div><button className="primary" onClick={onCredential}>{clusters.length ? "Refresh discovery" : "+ Connect & discover"}</button></div>{clusters.length ? <div className="discovered-clusters">{clusters.map((item) => <div className="discovered-cluster" key={`${item.region}:${item.name}`}><div className="credential-icon">EKS</div><div><strong>{item.name}</strong><span>{item.region} · Kubernetes {item.version} · {item.vpc.VpcId}</span><small title={item.assignedRoleArn}>Role: {item.assignedRoleName}</small></div><em className="healthy">{item.status}</em></div>)}</div> : <div className="credential-grid">{credentials.slice(0, 1).map(([name,type,account,status,rotated]) => <div className="credential-card muted-card" key={name}><div className="credential-icon">AWS</div><div><strong>Example: {name}</strong><span>{type} · account {account}</span><small>Connect credentials to replace this example</small></div><em className="healthy">{status}</em><button className="tiny-btn">•••</button></div>)}</div>}</div></details>
-    <details className="admin-card admin-fold"><summary><div><strong>EKS connectivity</strong><span>Bastion and AWS Systems Manager tunnels for private Kubernetes API endpoints</span></div><b>No tunnel configured</b></summary><div className="admin-card-body"><div className="bastion-layout"><div className="bastion-visual"><span className="bastion-node">KM</span><i/><span className="bastion-node gateway">SSH</span><i/><span className="bastion-node eks">EKS</span></div><div className="bastion-copy"><strong>Connect {cluster} through a private path</strong><p>Create an SSH local-forward or Session Manager tunnel. KubeMan keeps the key or AWS profile as an encrypted reference and applies the EKS TLS server name automatically.</p><div className="bastion-features"><span>✓ SSH bastion</span><span>✓ SSM Session Manager</span><span>✓ Automatic reconnect</span><span>✓ Health checks</span></div></div><div className="bastion-actions"><button className="primary" onClick={onBastion}>+ Add bastion tunnel</button><button className="secondary" onClick={() => notify("No tunnel profile to test yet")}>Test connection</button></div></div></div></details>
+function AdminView({ user, cluster, clusters, onCredential, onBastion, notify }: { user: User; cluster: string; clusters: AwsCluster[]; onCredential: () => void; onBastion: () => void; notify: (message: string) => void }) {
+  const access = useAccess(user);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const canCredentials = can(user, "credentials:manage");
+  const canClusters = can(user, "clusters:manage");
+  const admins = access.members.filter((member) => member.roleId === "admin" && member.status === "active").length;
+  return <main className="admin-page admin-standalone"><div className="admin-titlebar"><div><span className="admin-kicker">Organization controls</span><h1>Workspace administration</h1><p>Identity, credentials, retention, and storage—separate from day-to-day cluster operations.</p></div>{can(user, "users:manage") && <button className="primary" onClick={() => setInviteOpen(true)}>+ Invite member</button>}</div><div className="stat-grid admin-stats"><div className="stat-card"><span>Active members</span><strong>{can(user, "users:view") ? access.members.filter((member) => member.status === "active").length : "—"}</strong><small>{can(user, "users:view") ? `${admins} administrator${admins === 1 ? "" : "s"} · ${access.members.filter((member) => member.status === "invited").length} invited` : "Not permitted to view"}</small></div><div className="stat-card"><span>Discovered EKS clusters</span><strong>{clusters.length}</strong><small>{clusters.length ? `${new Set(clusters.map((item) => item.accountId)).size} AWS account${new Set(clusters.map((item) => item.accountId)).size === 1 ? "" : "s"}` : "Connect AWS to discover"}</small></div><div className="stat-card"><span>Encrypted storage</span><strong>2.4 GB</strong><small>Healthy</small></div><div className="stat-card"><span>Audit retention</span><strong>90 days</strong><small>1,284 events</small></div></div><div className="admin-sections">
+    {can(user, "users:view") && <UsersPanel user={user} access={access} notify={notify} invite={() => setInviteOpen(true)} />}
+    {can(user, "users:view") && <RolesPanel user={user} access={access} notify={notify} />}
+    {can(user, "audit:view") && <AuditPanel />}
+    <details className="admin-card admin-fold" open><summary><div><strong>AWS credential vault & EKS discovery</strong><span>Connect a mounted profile or temporary credentials, then pull clusters and infrastructure</span></div><b>{clusters.length ? `${clusters.length} clusters` : "Not connected"}</b></summary><div className="admin-card-body"><div className="vault-notice"><span>◆</span><div><strong>Discover without storing raw secret values</strong><p>Access keys are used only for the discovery request. Cluster details and the assigned role are saved persistently.</p></div>{canCredentials && <button className="primary" onClick={onCredential}>{clusters.length ? "Refresh discovery" : "+ Connect & discover"}</button>}</div>{clusters.length ? <div className="discovered-clusters">{clusters.map((item) => <div className="discovered-cluster" key={`${item.region}:${item.name}`}><div className="credential-icon">EKS</div><div><strong>{item.name}</strong><span>{item.region} · Kubernetes {item.version} · {item.vpc.VpcId}</span><small title={item.assignedRoleArn}>Role: {item.assignedRoleName}</small></div><em className="healthy">{item.status}</em></div>)}</div> : <div className="credential-grid">{credentials.slice(0, 1).map(([name,type,account,status,rotated]) => <div className="credential-card muted-card" key={name}><div className="credential-icon">AWS</div><div><strong>Example: {name}</strong><span>{type} · account {account}</span><small>Connect credentials to replace this example</small></div><em className="healthy">{status}</em><button className="tiny-btn">•••</button></div>)}</div>}</div></details>
+    <details className="admin-card admin-fold"><summary><div><strong>EKS connectivity</strong><span>Bastion and AWS Systems Manager tunnels for private Kubernetes API endpoints</span></div><b>No tunnel configured</b></summary><div className="admin-card-body"><div className="bastion-layout"><div className="bastion-visual"><span className="bastion-node">KM</span><i/><span className="bastion-node gateway">SSH</span><i/><span className="bastion-node eks">EKS</span></div><div className="bastion-copy"><strong>Connect {cluster} through a private path</strong><p>Create an SSH local-forward or Session Manager tunnel. KubeMan keeps the key or AWS profile as an encrypted reference and applies the EKS TLS server name automatically.</p><div className="bastion-features"><span>✓ SSH bastion</span><span>✓ SSM Session Manager</span><span>✓ Automatic reconnect</span><span>✓ Health checks</span></div></div><div className="bastion-actions">{canClusters && <button className="primary" onClick={onBastion}>+ Add bastion tunnel</button>}<button className="secondary" onClick={() => notify("No tunnel profile to test yet")}>Test connection</button></div></div></div></details>
     <details className="admin-card admin-fold"><summary><div><strong>Storage & persistence</strong><span>Application state, terminal homes, kubeconfigs, backups, and retention</span></div><b>All systems healthy</b></summary><div className="admin-card-body"><div className="storage-grid"><StorageRow name="Workspace database" detail="Users, roles, saved views, and audit metadata" value="48 MB" status="Encrypted"/><StorageRow name="Terminal home volumes" detail="Shell profiles, history, and user workspace files" value="1.8 GB" status="Persistent"/><StorageRow name="Kubeconfig references" detail="Read-only mounts and encrypted connection metadata" value="8 files" status="Protected"/><StorageRow name="Audit archive" detail="Immutable activity records · 90-day retention" value="612 MB" status="Backed up"/></div><div className="storage-foot"><span>Last backup completed today at 03:20 · next scheduled in 15 hours</span><button className="secondary" onClick={() => notify("Storage integrity check queued")}>Run integrity check</button></div></div></details>
-  </div></main>;
+  </div>{inviteOpen && <InviteModal access={access} close={() => setInviteOpen(false)} done={(message) => { setInviteOpen(false); notify(message); }} />}</main>;
 }
 
 function StorageRow({ name, detail, value, status }: { name: string; detail: string; value: string; status: string }) {
@@ -377,13 +380,12 @@ function StorageRow({ name, detail, value, status }: { name: string; detail: str
 }
 
 function Modal({ type, close, submit }: { type: ModalType; close: () => void; submit: (input?: AwsCredentialInput) => Promise<void> | void }) {
-  const invite = type === "invite";
   const bastion = type === "bastion";
   const credential = type === "credential";
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const title = invite ? "Invite a member" : bastion ? "Add bastion tunnel" : "Add AWS credentials";
-  const description = invite ? "Grant workspace access with a controlled role." : bastion ? "Create a protected route to the private EKS Kubernetes API." : "Validate AWS access, discover EKS clusters, and save their infrastructure and assigned role.";
+  const title = bastion ? "Add bastion tunnel" : "Add AWS credentials";
+  const description = bastion ? "Create a protected route to the private EKS Kubernetes API." : "Validate AWS access, discover EKS clusters, and save their infrastructure and assigned role.";
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -395,7 +397,7 @@ function Modal({ type, close, submit }: { type: ModalType; close: () => void; su
     setBusy(true); setError("");
     try { await submit(input); } catch (failure) { setError(failure instanceof Error ? failure.message : "Request failed"); setBusy(false); }
   }
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}><form className={`modal ${bastion || credential ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title} onSubmit={handleSubmit}><div className="modal-head"><div><h2>{title}</h2><p>{description}</p></div><button type="button" className="close" onClick={close}>×</button></div><div className="modal-body">{invite ? <><Field label="Email address"><input placeholder="operator@company.com"/></Field><Field label="Role"><select defaultValue="Operator"><option>Operator</option><option>Viewer</option><option>Admin</option></select></Field><Field label="Environment access"><select defaultValue="Selected environments"><option>Selected environments</option><option>All environments</option><option>Read only</option></select></Field></> : bastion ? <><div className="field-grid"><Field label="Tunnel name"><input defaultValue="production-eks-bastion"/></Field><Field label="Tunnel method"><select defaultValue="SSH local forward"><option>SSH local forward</option><option>AWS SSM Session Manager</option></select></Field></div><Field label="Private EKS endpoint"><input placeholder="https://ABCDEF.gr7.us-east-1.eks.amazonaws.com"/></Field><div className="field-grid"><Field label="Bastion host"><input placeholder="bastion.internal.example.com"/></Field><Field label="SSH port"><input defaultValue="22" inputMode="numeric"/></Field></div><div className="field-grid"><Field label="SSH user"><input defaultValue="ec2-user"/></Field><Field label="Authentication reference"><select defaultValue="Mounted SSH agent"><option>Mounted SSH agent</option><option>Encrypted private key</option><option>AWS credential profile</option></select></Field></div><div className="field-grid"><Field label="Local port"><input defaultValue="6443" inputMode="numeric"/></Field><Field label="TLS server name"><input placeholder="ABCDEF.gr7.us-east-1.eks.amazonaws.com"/></Field></div><label className="check-row"><input type="checkbox" defaultChecked/><span>Automatically reconnect and health-check this tunnel</span></label></> : <><div className="discovery-note"><strong>Use a mounted profile or temporary access keys</strong><span>Leave access keys empty to use the selected profile from your Mac. Raw keys are never written to disk.</span></div><div className="field-grid"><Field label="Mounted AWS profile"><input name="profile" defaultValue="default" placeholder="default" autoComplete="off"/></Field><Field label="Region"><input name="region" defaultValue="us-east-1" placeholder="us-east-1 or all" autoComplete="off"/></Field></div><Field label="Assume role ARN (optional)"><input name="roleArn" placeholder="arn:aws:iam::123456789012:role/KubeMan" autoComplete="off"/></Field><div className="field-grid"><Field label="Access key ID (optional)"><input name="accessKeyId" autoComplete="off"/></Field><Field label="Secret access key (optional)"><input name="secretAccessKey" type="password" autoComplete="new-password"/></Field></div><Field label="Session token (optional)"><input name="sessionToken" type="password" autoComplete="new-password"/></Field></>}{error && <div className="modal-error">{error}</div>}</div><div className="modal-foot"><button type="button" className="secondary" onClick={close} disabled={busy}>Cancel</button><button type="submit" className="primary" disabled={busy}>{busy ? "Discovering AWS…" : invite ? "Send invitation" : bastion ? "Validate & save tunnel" : "Connect & discover clusters"}</button></div></form></div>;
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}><form className={`modal ${bastion || credential ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title} onSubmit={handleSubmit}><div className="modal-head"><div><h2>{title}</h2><p>{description}</p></div><button type="button" className="close" onClick={close}>×</button></div><div className="modal-body">{bastion ? <><div className="field-grid"><Field label="Tunnel name"><input defaultValue="production-eks-bastion"/></Field><Field label="Tunnel method"><select defaultValue="SSH local forward"><option>SSH local forward</option><option>AWS SSM Session Manager</option></select></Field></div><Field label="Private EKS endpoint"><input placeholder="https://ABCDEF.gr7.us-east-1.eks.amazonaws.com"/></Field><div className="field-grid"><Field label="Bastion host"><input placeholder="bastion.internal.example.com"/></Field><Field label="SSH port"><input defaultValue="22" inputMode="numeric"/></Field></div><div className="field-grid"><Field label="SSH user"><input defaultValue="ec2-user"/></Field><Field label="Authentication reference"><select defaultValue="Mounted SSH agent"><option>Mounted SSH agent</option><option>Encrypted private key</option><option>AWS credential profile</option></select></Field></div><div className="field-grid"><Field label="Local port"><input defaultValue="6443" inputMode="numeric"/></Field><Field label="TLS server name"><input placeholder="ABCDEF.gr7.us-east-1.eks.amazonaws.com"/></Field></div><label className="check-row"><input type="checkbox" defaultChecked/><span>Automatically reconnect and health-check this tunnel</span></label></> : <><div className="discovery-note"><strong>Use a mounted profile or temporary access keys</strong><span>Leave access keys empty to use the selected profile from your Mac. Raw keys are never written to disk.</span></div><div className="field-grid"><Field label="Mounted AWS profile"><input name="profile" defaultValue="default" placeholder="default" autoComplete="off"/></Field><Field label="Region"><input name="region" defaultValue="us-east-1" placeholder="us-east-1 or all" autoComplete="off"/></Field></div><Field label="Assume role ARN (optional)"><input name="roleArn" placeholder="arn:aws:iam::123456789012:role/KubeMan" autoComplete="off"/></Field><div className="field-grid"><Field label="Access key ID (optional)"><input name="accessKeyId" autoComplete="off"/></Field><Field label="Secret access key (optional)"><input name="secretAccessKey" type="password" autoComplete="new-password"/></Field></div><Field label="Session token (optional)"><input name="sessionToken" type="password" autoComplete="new-password"/></Field></>}{error && <div className="modal-error">{error}</div>}</div><div className="modal-foot"><button type="button" className="secondary" onClick={close} disabled={busy}>Cancel</button><button type="submit" className="primary" disabled={busy}>{busy ? "Discovering AWS…" : bastion ? "Validate & save tunnel" : "Connect & discover clusters"}</button></div></form></div>;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) { return <div className="field"><label>{label}</label>{children}</div>; }

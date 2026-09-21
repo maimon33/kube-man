@@ -21,5 +21,5 @@ WORKDIR /home/operator
 
 EXPOSE 7681
 HEALTHCHECK --interval=15s --timeout=4s --start-period=10s --retries=4 \
-  CMD wget -q -O /dev/null http://127.0.0.1:7681/ || exit 1
-CMD ["ttyd", "-W", "-a", "-p", "7681", "-i", "0.0.0.0", "-t", "titleFixed=KubeMan Shell", "-t", "fontSize=13", "-t", "cursorBlink=true", "kubeman-context-shell"]
+  CMD wget -q -O /dev/null http://127.0.0.1:7681/_km/shell/ || exit 1
+CMD ["ttyd", "-W", "-a", "-p", "7681", "-i", "0.0.0.0", "-b", "/_km/shell", "-O", "-t", "titleFixed=KubeMan Shell", "-t", "fontSize=13", "-t", "cursorBlink=true", "kubeman-context-shell"]

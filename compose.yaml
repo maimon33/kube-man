@@ -6,15 +6,33 @@ services:
     image: kubeman-console:local
     container_name: kubeman
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${KUBEMAN_PORT:-3080}:3000"
     environment:
       NODE_ENV: production
       PORT: 3000
       HOST: 0.0.0.0
     volumes:
       - kubeman-data:/app/data
+
+  # Single public entry point. Everything else stays on the private compose
+  # network. Set KUBEMAN_BIND=0.0.0.0 to serve remote users, and put TLS in
+  # front (KUBEMAN_SITE_ADDRESS=your.domain for built-in HTTPS, or your own proxy).
+  kubeman-gateway:
+    image: caddy:2-alpine
+    container_name: kubeman-gateway
+    restart: unless-stopped
+    ports:
+      - "${KUBEMAN_BIND:-127.0.0.1}:${KUBEMAN_PORT:-3080}:80"
+      - "${KUBEMAN_BIND:-127.0.0.1}:${KUBEMAN_HTTPS_PORT:-3443}:443"
+    environment:
+      KUBEMAN_SITE_ADDRESS: "${KUBEMAN_SITE_ADDRESS:-:80}"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - kubeman-gateway-data:/data
+    security_opt:
+      - no-new-privileges:true
     depends_on:
+      kubeman:
+        condition: service_healthy
       kubeman-shell:
         condition: service_healthy
       kubeman-aws:
@@ -29,8 +47,6 @@ services:
     image: kubeman-shell:local
     container_name: kubeman-shell
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${KUBEMAN_SHELL_PORT:-7681}:7681"
     environment:
       TERM: xterm-256color
       COLORTERM: truecolor
@@ -56,8 +72,6 @@ services:
     container_name: kubeman-aws
     restart: unless-stopped
     command: ["python3", "/usr/local/bin/kubeman-aws-discovery"]
-    ports:
-      - "127.0.0.1:${KUBEMAN_AWS_PORT:-7682}:7682"
     environment:
       HOME: /home/operator
       PYTHONDONTWRITEBYTECODE: "1"
@@ -87,13 +101,15 @@ services:
     container_name: kubeman-bootstrap
     restart: unless-stopped
     command: ["python3", "/usr/local/bin/kubeman-bootstrap"]
-    ports:
-      - "127.0.0.1:${KUBEMAN_BOOTSTRAP_PORT:-7683}:7683"
     environment:
       HOME: /home/operator
       PYTHONDONTWRITEBYTECODE: "1"
       KUBEMAN_GOOGLE_CLIENT_ID: "${KUBEMAN_GOOGLE_CLIENT_ID:-}"
       KUBEMAN_GOOGLE_CLIENT_SECRET: "${KUBEMAN_GOOGLE_CLIENT_SECRET:-}"
+      # Browser-facing URL, e.g. https://kubeman.example.com. Leave empty to
+      # derive it from the request (works for localhost and proxies that
+      # forward Host / X-Forwarded-Proto).
+      KUBEMAN_PUBLIC_URL: "${KUBEMAN_PUBLIC_URL:-}"
     volumes:
       - kubeman-bootstrap-data:/home/operator/.kubeman-bootstrap
     tmpfs:
@@ -118,3 +134,5 @@ volumes:
     name: kubeman-shell-home
   kubeman-bootstrap-data:
     name: kubeman-bootstrap-data
+  kubeman-gateway-data:
+    name: kubeman-gateway-data
