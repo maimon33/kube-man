@@ -1,0 +1,122 @@
+name: Build, push to ECR and deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# One deployment at a time; a newer push waits instead of racing the server.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  AWS_ROLE_ARN: arn:aws:iam::236565801201:role/maimons-infra-github-ssm
+  ECR_REPOSITORY: kubeman
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Identity service tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # One ECR repository holds both images, told apart by tag prefix:
+      #   kubeman:web-<sha>    web console
+      #   kubeman:shell-<sha>  terminal, AWS discovery and identity services
+      - name: Build images
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -f docker/Dockerfile.web \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:web-$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:web-latest" .
+          docker build -f docker/Dockerfile.shell \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:shell-$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:shell-latest" .
+
+      - name: Push images to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push --all-tags "$ECR_REGISTRY/$ECR_REPOSITORY"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/kubeman' }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Prepare SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Copy deployment files to server
+        env:
+          DEPLOY_TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+        run: |
+          SSH="ssh -p $DEPLOY_PORT -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          tar czf - compose.yaml compose.prod.yml deploy.sh docker/Caddyfile \
+            | $SSH "$DEPLOY_TARGET" "mkdir -p '$DEPLOY_PATH' && tar xzf - -C '$DEPLOY_PATH' && chmod +x '$DEPLOY_PATH/deploy.sh'"
+
+      # The ECR token is piped over SSH stdin, so the server needs no AWS
+      # credentials and the token never appears in a command line or log.
+      - name: Deploy over SSH
+        env:
+          DEPLOY_TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+          ECR_REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          SSH="ssh -p $DEPLOY_PORT -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | $SSH "$DEPLOY_TARGET" "cd '$DEPLOY_PATH' && ECR_REGISTRY='$ECR_REGISTRY' IMAGE_TAG='$IMAGE_TAG' ./deploy.sh"

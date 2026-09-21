@@ -1,0 +1,13 @@
+# Production override used by deploy.sh on the server:
+#   docker compose -f compose.yaml -f compose.prod.yml ...
+# Runs the images built by CI and pushed to ECR instead of building locally.
+# ECR_REGISTRY and IMAGE_TAG are supplied by deploy.sh.
+services:
+  kubeman:
+    image: "${ECR_REGISTRY:?}/kubeman:web-${IMAGE_TAG:?}"
+  kubeman-shell:
+    image: "${ECR_REGISTRY:?}/kubeman:shell-${IMAGE_TAG:?}"
+  kubeman-aws:
+    image: "${ECR_REGISTRY:?}/kubeman:shell-${IMAGE_TAG:?}"
+  kubeman-bootstrap:
+    image: "${ECR_REGISTRY:?}/kubeman:shell-${IMAGE_TAG:?}"

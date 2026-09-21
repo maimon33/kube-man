@@ -18,6 +18,27 @@ Last updated: 2026-09-22.
 | Bastion / SSM tunnels | UI mock | Modal saves nothing. |
 | Storage & persistence panel, stat cards | UI mock | "2.4 GB", "90 days", "1,284 events" are placeholders. |
 
+## Deployment
+
+`.github/workflows/deploy.yml` (push to `main` or manual): runs the identity tests, builds
+both images, pushes them to ECR repository `kubeman` (tags `web-<sha>` and `shell-<sha>`),
+then deploys over SSH. The workflow copies `compose.yaml`, `compose.prod.yml`, `deploy.sh`
+and `docker/Caddyfile` to the server, pipes an ECR login token over SSH stdin, and runs
+`deploy.sh`, which pulls, restarts, health-checks all services and rolls back to the
+previous tag on failure. Server-side settings live in `<DEPLOY_PATH>/.env` (see `.env.example`).
+
+Prerequisites, none yet done (this workflow will fail until they are):
+- ECR repository `kubeman` in account 236565801201 (eu-central-1). In `maimons-infra`
+  repositories come from the `services` map, so this needs a change there.
+- The OIDC role `maimons-infra-github-ssm` must trust `repo:maimon33/kube-man:*`
+  and be allowed to push to that repository.
+- GitHub secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS`
+  (output of `ssh-keyscan host`). Optional variables: `DEPLOY_PATH` (default `/opt/kubeman`),
+  `DEPLOY_PORT` (default 22).
+- Server: Docker with the compose plugin, `DEPLOY_USER` able to run docker and write
+  `DEPLOY_PATH`, an amd64 CPU (CI builds amd64 only), and `~/.kube` / `~/.aws` present
+  for the shell containers.
+
 ## Architecture
 
 ```
@@ -183,5 +204,7 @@ real shell, Google-identity RBAC.
 
 ## Session log
 
+- 2026-09-22 — Added deploy workflow (ECR build + SSH deploy), modeled on mosar's
+  build-and-push; SSH replaces its SSM step. Not yet run.
 - 2026-09-22 — Diagnosed and fixed remote bootstrap (gateway, public URL, auth on shell/AWS);
   added users/roles/permissions base, audit log, admin UI, tests, README, this file.
