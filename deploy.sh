@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Runs on the server (started over SSH by .github/workflows/deploy.yml).
-# Reads an ECR login password from stdin, pulls the images for IMAGE_TAG,
-# restarts the stack, waits until it is healthy and rolls back if it is not.
+# Runs on the server (started over SSM or SSH by .github/workflows/deploy.yml).
+# Pulls the images for IMAGE_TAG from ECR, restarts the stack, waits until it is
+# healthy and rolls back on failure.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 : "${ECR_REGISTRY:?ECR_REGISTRY is required}"
 : "${IMAGE_TAG:?IMAGE_TAG is required}"
+: "${AWS_REGION:=eu-central-1}"
 
 compose() { docker compose -f compose.yaml -f compose.prod.yml "$@"; }
 export ECR_REGISTRY
@@ -16,7 +17,7 @@ PORT="${PORT:-3080}"
 PREVIOUS_TAG="$(cat .deployed-tag 2>/dev/null || true)"
 
 echo "→ Authenticating with ECR..."
-docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null
+aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null
 
 start() {
   export IMAGE_TAG="$1"
