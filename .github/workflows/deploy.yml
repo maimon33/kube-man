@@ -126,8 +126,11 @@ jobs:
           mkdir -p "\$DEPLOY_PATH"
           mv * "\$DEPLOY_PATH/" 2>/dev/null || true
 
-          echo "→ Running deploy script..."
+          echo "→ Patching compose.yaml (remove Caddyfile volume mount)..."
           cd "\$DEPLOY_PATH"
+          sed -i '/docker\/Caddyfile/d' compose.yaml || true
+
+          echo "→ Running deploy script..."
           chmod +x deploy.sh
           ./deploy.sh
           DEPLOY_SCRIPT
