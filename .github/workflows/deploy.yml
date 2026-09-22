@@ -107,38 +107,34 @@ jobs:
           ECR_REGISTRY: ${{ needs.build-and-push.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          COMMAND=$(cat <<'EOF'
+          # Create deploy script
+          cat > /tmp/deploy-ssm.sh <<'DEPLOY_SCRIPT'
+          #!/bin/bash
           set -euo pipefail
-
           WORK_DIR=$(mktemp -d)
           trap 'rm -rf $WORK_DIR' EXIT
-
           cd "$WORK_DIR"
-
-          # Download deployment files from S3
           echo "→ Downloading deployment files from S3..."
           aws s3 sync s3://maimons-infra/kubeman/ . --region eu-central-1
-
-          # Move into deploy path (create if needed)
-          DEPLOY_PATH=$DEPLOY_PATH
           mkdir -p "$DEPLOY_PATH"
           mv * "$DEPLOY_PATH/" 2>/dev/null || true
-
-          # Execute deploy script
           echo "→ Running deploy script..."
           cd "$DEPLOY_PATH"
           chmod +x deploy.sh
-          export ECR_REGISTRY='$ECR_REGISTRY'
-          export IMAGE_TAG='$IMAGE_TAG'
-          export AWS_REGION='eu-central-1'
+          export ECR_REGISTRY
+          export IMAGE_TAG
+          export AWS_REGION
           ./deploy.sh
-          EOF
-          )
+          DEPLOY_SCRIPT
 
+          # Upload script to S3
+          aws s3 cp /tmp/deploy-ssm.sh s3://maimons-infra/kubeman/deploy-ssm.sh
+
+          # Send command via SSM (single-line to avoid JSON parsing issues)
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --parameters "commands=[$COMMAND]" \
+            --parameters 'commands=["cd /tmp && aws s3 cp s3://maimons-infra/kubeman/deploy-ssm.sh . && chmod +x deploy-ssm.sh && DEPLOY_PATH='\''/opt/kubeman'\'' ECR_REGISTRY='\''"$ECR_REGISTRY"'\'' IMAGE_TAG='\''"$IMAGE_TAG"'\'' AWS_REGION=eu-central-1 ./deploy-ssm.sh"]' \
             --region "$AWS_REGION" \
             --query 'Command.CommandId' \
             --output text)
