@@ -100,7 +100,7 @@ jobs:
           aws s3 cp compose.yaml s3://maimons-infra/kubeman/compose.yaml
           aws s3 cp compose.prod.yml s3://maimons-infra/kubeman/compose.prod.yml
           aws s3 cp deploy.sh s3://maimons-infra/kubeman/deploy.sh
-          aws s3 cp docker/Caddyfile s3://maimons-infra/kubeman/Caddyfile
+          aws s3 cp docker/Caddyfile s3://maimons-infra/kubeman/docker/Caddyfile
 
       - name: Deploy via SSM
         env:
