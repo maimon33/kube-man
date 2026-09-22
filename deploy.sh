@@ -31,8 +31,8 @@ healthy() {
   for name in kubeman kubeman-bootstrap kubeman-shell kubeman-aws; do
     [ "$(docker inspect -f '{{.State.Health.Status}}' "$name" 2>/dev/null)" = "healthy" ] || return 1
   done
-  # Gateway answers (a redirect is fine when it terminates HTTPS itself).
-  curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/status" | grep -qE '^[23]'
+  # Check kubeman directly (port 3000) instead of gateway (which may be disabled)
+  curl -sf "http://127.0.0.1:3000/" >/dev/null 2>&1
 }
 
 wait_healthy() {
