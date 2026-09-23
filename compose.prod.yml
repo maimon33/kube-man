@@ -11,10 +11,3 @@ services:
     image: "${ECR_REGISTRY:?}/kubeman:shell-${IMAGE_TAG:?}"
   kubeman-bootstrap:
     image: "${ECR_REGISTRY:?}/kubeman:shell-${IMAGE_TAG:?}"
-  # Gateway disabled: Caddyfile not yet available
-  # Remove volume mount and dependencies, set to harmless state
-  kubeman-gateway:
-    image: caddy:2-alpine
-    entrypoint: ["sleep", "infinity"]
-    volumes: []
-    depends_on: {}
